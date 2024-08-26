@@ -1,13 +1,21 @@
 #include <stdio.h>
 #include <cuda_runtime.h>
+#include <math.h>
 
 #define WIDTH  800  // ความกว้างของภาพ
 #define HEIGHT 600  // ความสูงของภาพ
-#define MAX_DEPTH 3  // ความลึกสูงสุดของการสะท้อน
 
 // โครงสร้างสำหรับสี
 struct Color {
     float r, g, b;
+
+    __device__ Color operator*(float t) const {
+        return Color{r * t, g * t, b * t};
+    }
+
+    __device__ Color operator+(const Color& c) const {
+        return Color{r + c.r, g + c.g, b + c.b};
+    }
 };
 
 // โครงสร้างสำหรับเวกเตอร์ 3 มิติ
@@ -36,12 +44,13 @@ struct Vec3 {
     }
 };
 
-// CUDA kernel สำหรับการทำ Ray Tracing พร้อม Reflection
-__device__ Color trace_ray(const Vec3& ray_origin, const Vec3& ray_direction, Vec3 sphere_center, float sphere_radius, int depth) {
-    Color black = {0.0f, 0.0f, 0.0f};
-    if (depth > MAX_DEPTH) return black;
+// ฟังก์ชันสำหรับการสะท้อนแสง
+__device__ Vec3 reflect(const Vec3& v, const Vec3& n) {
+    return v - n * 2.0f * v.dot(n);
+}
 
-    // คำนวณการชนกับทรงกลม (Ray-Sphere Intersection)
+// ฟังก์ชัน hit_sphere ที่ตรวจสอบการชนและคืนค่าพื้นผิวของทรงกลม
+__device__ bool hit_sphere(const Vec3& sphere_center, float sphere_radius, const Vec3& ray_origin, const Vec3& ray_direction, Vec3& hit_point, Vec3& normal) {
     Vec3 oc = ray_origin - sphere_center;
     float a = ray_direction.dot(ray_direction);
     float b = 2.0f * oc.dot(ray_direction);
@@ -49,36 +58,50 @@ __device__ Color trace_ray(const Vec3& ray_origin, const Vec3& ray_direction, Ve
     float discriminant = b * b - 4 * a * c;
 
     if (discriminant > 0) {
-        // รังสีชนกับทรงกลม
-        float t = (-b - sqrtf(discriminant)) / (2.0f * a);
-        Vec3 hit_point = ray_origin + ray_direction * t;
-        Vec3 normal = (hit_point - sphere_center).normalize();
-
-        // คำนวณทิศทางของรังสีที่สะท้อน
-        Vec3 reflection_dir = ray_direction - normal * 2.0f * ray_direction.dot(normal);
-        reflection_dir = reflection_dir.normalize();
-
-        // สีของการสะท้อน
-        Color reflection_color = trace_ray(hit_point, reflection_dir, sphere_center, sphere_radius, depth + 1);
-
-        // การรวมสีของการชนกับสีของการสะท้อน
-        Color hit_color = {1.0f, 0.0f, 0.0f};  // สีของทรงกลม
-        hit_color.r = hit_color.r * 0.8f + reflection_color.r * 0.2f;
-        hit_color.g = hit_color.g * 0.8f + reflection_color.g * 0.2f;
-        hit_color.b = hit_color.b * 0.8f + reflection_color.b * 0.2f;
-
-        return hit_color;
+        float t = (-b - sqrt(discriminant)) / (2.0f * a);
+        hit_point = ray_origin + ray_direction * t;
+        normal = (hit_point - sphere_center).normalize();
+        return true;
     }
-
-    // พื้นหลัง
-    Color background_color = {0.5f, 0.7f, 1.0f};  // สีพื้นหลัง (ฟ้า)
-    return background_color;
+    
+    return false;
 }
 
-__global__ void ray_tracing(Color *image, Vec3 sphere_center, float sphere_radius) {
+// ฟังก์ชัน trace_ray สำหรับการคำนวณการสะท้อนแสง
+__device__ Color trace_ray(const Vec3& ray_origin, const Vec3& ray_direction, int depth) {
+    Vec3 sphere_center1 = {0.0f, 0.0f, -1.0f};
+    Vec3 sphere_center2 = {0.5f, 0.0f, -1.5f};
+    float sphere_radius1 = 0.5f;
+    float sphere_radius2 = 0.3f;
+    Vec3 hit_point, normal;
+
+    if (depth <= 0) {
+        return Color{0.0f, 0.0f, 0.0f};  // หากไม่มี depth คงเหลือให้คืนค่าสีดำ
+    }
+
+    // ตรวจสอบการชนกับทรงกลมแรก
+    if (hit_sphere(sphere_center1, sphere_radius1, ray_origin, ray_direction, hit_point, normal)) {
+        Vec3 reflected_direction = reflect(ray_direction, normal).normalize();
+        Color reflected_color = trace_ray(hit_point, reflected_direction, depth - 1);
+        return Color{1.0f, 0.0f, 0.0f} * 0.5f + reflected_color * 0.5f;  // สีแดง + สีสะท้อน
+    }
+
+    // ตรวจสอบการชนกับทรงกลมที่สอง
+    if (hit_sphere(sphere_center2, sphere_radius2, ray_origin, ray_direction, hit_point, normal)) {
+        Vec3 reflected_direction = reflect(ray_direction, normal).normalize();
+        Color reflected_color = trace_ray(hit_point, reflected_direction, depth - 1);
+        return Color{0.0f, 1.0f, 0.0f} * 0.5f + reflected_color * 0.5f;  // สีเขียว + สีสะท้อน
+    }
+
+    // พื้นหลังถ้าไม่มีการชน
+    return Color{0.5f, 0.7f, 1.0f};  // พื้นหลังสีฟ้า
+}
+
+// CUDA kernel สำหรับ Ray Tracing พร้อมการสะท้อนแสง
+__global__ void ray_tracing(Color *image) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
-    
+
     if (x < WIDTH && y < HEIGHT) {
         int idx = y * WIDTH + x;
 
@@ -89,8 +112,8 @@ __global__ void ray_tracing(Color *image, Vec3 sphere_center, float sphere_radiu
         Vec3 ray_direction = {2.0f * u - 1.0f, 2.0f * v - 1.0f, -1.0f};  // รังสีออกจากกล้อง
         ray_direction = ray_direction.normalize();
 
-        // คำนวณสีของพิกเซล
-        image[idx] = trace_ray(ray_origin, ray_direction, sphere_center, sphere_radius, 0);
+        // คำนวณสีของพิกเซล พร้อมการสะท้อนแสง (depth = 5)
+        image[idx] = trace_ray(ray_origin, ray_direction, 5);
     }
 }
 
@@ -104,10 +127,6 @@ int main() {
     Color *d_image;
     cudaMalloc(&d_image, size);
 
-    // กำหนดพารามิเตอร์ของทรงกลม
-    Vec3 sphere_center = {0.0f, 0.0f, -1.0f};  // ทรงกลมอยู่ที่ (0, 0, -1)
-    float sphere_radius = 0.5f;  // รัศมีของทรงกลม
-
     // กำหนดจำนวนบล็อกและเทรด
     dim3 threads_per_block(16, 16);
     dim3 number_of_blocks((WIDTH + threads_per_block.x - 1) / threads_per_block.x, 
@@ -119,7 +138,7 @@ int main() {
     cudaEventCreate(&stop);
 
     cudaEventRecord(start);
-    ray_tracing<<<number_of_blocks, threads_per_block>>>(d_image, sphere_center, sphere_radius);
+    ray_tracing<<<number_of_blocks, threads_per_block>>>(d_image);
     cudaEventRecord(stop);
 
     cudaEventSynchronize(stop);
